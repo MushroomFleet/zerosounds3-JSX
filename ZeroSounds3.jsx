@@ -1,0 +1,1457 @@
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+
+// ============================================================================
+// ZEROSOUNDS3.JSX - Zero Sounds 3 (Xbox Classic style SFX synthesis)
+//
+// Deterministic sound effects in the style of the original Xbox audio
+// processor (the MCPX APU). Every sound is three or four hardware-style
+// voices; every voice is
+//
+//   procedural source sample -> PCM16 or Xbox ADPCM storage -> pitch stepping
+//   in 1/4096-octave units -> DLS2-form resonant low-pass -> amplitude DAHDSR
+//   -> 3D placement (interaural delay + head shadow)
+//
+// mixed at 48 kHz and sent through an I3DL2-parameter reverb. Control values
+// (envelopes, LFO, pitch, filter) update once per 32-sample frame, 1500 times
+// a second, as on the hardware. The whole sound is rendered offline to 16-bit
+// stereo 48 kHz, then played from a buffer.
+//
+// ZeroBytes rules: every parameter comes from hash(sound anchor, worldSeed).
+// No Math.random(), no stored presets, and no Math.sin/exp/pow in the signal
+// path, so output is bit-identical on every JS engine and to ZeroSounds3.py.
+//
+// COMPONENT PROPS (all optional)
+//   initialSeed    number   world seed on mount, u32            default 0x1337BEEF
+//   initialVolume  number   master volume 0..1                  default 0.7
+//   initialRoom    string   'auto' or a key of ZS_ROOMS         default 'auto'
+//   onPlay         function (name: string, patch: object, render: object) => void
+//                           called after a sound starts          default null
+//   className      string   extra class on the root element     default ''
+//
+// ENGINE EXPORTS (pure, no React, no DOM)
+//   zbHash zbFloat zbRange zbInt            hash core (same as ZeroSounds 1 and 2)
+//   zbDeriveParams(name, worldSeed)         named sound -> patch
+//   zbRandomize(n, worldSeed)               unnamed patch at position n
+//   zsRender(patch)                         patch -> { left, right: Int16Array, ... }
+//   zsChecksum(render)                      CRC-32 of the interleaved PCM
+//   zsEncodeWav(render)                     -> Uint8Array (RIFF/WAVE)
+//   zbVerifyOne / zbVerifyAll               render twice, compare, check the oracle
+//   ZS3Engine                               Web Audio playback of renders
+//
+// The block between <ENGINE> and </ENGINE> is the algorithm core and is the
+// natural boundary for a .ts module when porting to TypeScript.
+// ============================================================================
+
+// <ENGINE>
+const ZS_SR = 48000;
+const ZS_FRAME = 32;                 // samples per APU frame
+const ZS_FPS = 1500;                 // frames per second
+const ZS_DEFAULT_SEED = 0x1337BEEF;
+
+// ---------------------------------------------------------------------------
+// 1. ZB HASH CORE (identical to ZeroSounds 1 and 2)
+// ---------------------------------------------------------------------------
+function zbHash(key, seed = 0) {
+  let h = (seed ^ 0x9e3779b9) >>> 0;
+  if (typeof key === 'number') {
+    h ^= (key >>> 0);
+    h = Math.imul(h, 0xcc9e2d51) >>> 0;
+    h = ((h << 15) | (h >>> 17)) >>> 0;
+    h = Math.imul(h, 0x1b873593) >>> 0;
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x85ebca6b) >>> 0;
+    h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35) >>> 0;
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x5bd1e995) >>> 0;
+    h ^= h >>> 15;
+  }
+  return h >>> 0;
+}
+function zbFloat(hash) { return (hash & 0xFFFFFF) / 0x1000000; }
+function zbRange(hash, min, max) { return min + zbFloat(hash) * (max - min); }
+function zbInt(hash, min, max) { return min + (hash % (max - min + 1)); }
+function zbPick(hash, arr) { return arr[hash % arr.length]; }
+
+// ---------------------------------------------------------------------------
+// 2. DETERMINISTIC MATH - only + - * / and floor, in a fixed order
+// ---------------------------------------------------------------------------
+const ZS_PI = 3.141592653589793;
+const ZS_TWO_PI = 6.283185307179586;
+const ZS_HALF_PI = 1.5707963267948966;
+const ZS_LN2 = 0.6931471805599453;
+const ZS_DB2OCT = 0.16609640474436813;   // log2(10) / 20: decibels -> octaves of gain
+const ZS_LOG2_10 = 3.321928094887362;
+const ZS_S = [-1.0 / 6.0, 1.0 / 120.0, -1.0 / 5040.0, 1.0 / 362880.0,
+  -1.0 / 39916800.0, 1.0 / 6227020800.0, -1.0 / 1307674368000.0];
+const ZS_E = [1.0 / 2.0, 1.0 / 6.0, 1.0 / 24.0, 1.0 / 120.0, 1.0 / 720.0, 1.0 / 5040.0,
+  1.0 / 40320.0, 1.0 / 362880.0, 1.0 / 3628800.0, 1.0 / 39916800.0,
+  1.0 / 479001600.0, 1.0 / 6227020800.0];
+
+function dsin(x) {
+  let r = x - Math.floor(x / ZS_TWO_PI + 0.5) * ZS_TWO_PI;
+  if (r > ZS_HALF_PI) r = ZS_PI - r;
+  if (r < -ZS_HALF_PI) r = -ZS_PI - r;
+  const r2 = r * r;
+  let p = ZS_S[6];
+  for (let k = 5; k >= 0; k--) p = p * r2 + ZS_S[k];
+  return r * (1.0 + r2 * p);
+}
+function dexp2(x) {
+  let n = Math.floor(x);
+  const y = (x - n) * ZS_LN2;
+  let p = ZS_E[11];
+  for (let k = 10; k >= 0; k--) p = p * y + ZS_E[k];
+  let e = 1.0 + y * (1.0 + y * p);
+  while (n > 0) { e *= 2.0; n--; }
+  while (n < 0) { e *= 0.5; n++; }
+  return e;
+}
+function zsRnd(x) { return Math.floor(x + 0.5); }
+
+// ---------------------------------------------------------------------------
+// 3. SOUND TAXONOMY (anchors only - no parameters are stored)
+// ---------------------------------------------------------------------------
+// level: peak target for the category, as a fraction of full scale.
+const ZB_CATEGORIES = {
+  ui:          { index: 0, freqLow: 400, freqHigh: 1200, durLow: 0.05, durHigh: 0.18, wetLow: 0.10, wetHigh: 0.30, azMax: 25.0, level: 0.60, rooms: ['room', 'corridor', 'chamber'] },
+  pickup:      { index: 1, freqLow: 600, freqHigh: 1700, durLow: 0.08, durHigh: 0.30, wetLow: 0.18, wetHigh: 0.40, azMax: 35.0, level: 0.66, rooms: ['chamber', 'hall'] },
+  movement:    { index: 2, freqLow: 80,  freqHigh: 360,  durLow: 0.05, durHigh: 0.20, wetLow: 0.05, wetHigh: 0.20, azMax: 40.0, level: 0.56, rooms: ['room', 'corridor'] },
+  combat:      { index: 3, freqLow: 100, freqHigh: 800,  durLow: 0.06, durHigh: 0.35, wetLow: 0.10, wetHigh: 0.30, azMax: 60.0, level: 0.84, rooms: ['corridor', 'chamber', 'hangar'] },
+  impact:      { index: 4, freqLow: 40,  freqHigh: 180,  durLow: 0.15, durHigh: 0.60, wetLow: 0.20, wetHigh: 0.45, azMax: 50.0, level: 0.89, rooms: ['chamber', 'hall', 'hangar', 'cavern'] },
+  power:       { index: 5, freqLow: 220, freqHigh: 900,  durLow: 0.30, durHigh: 0.90, wetLow: 0.25, wetHigh: 0.50, azMax: 30.0, level: 0.74, rooms: ['hall', 'cavern'] },
+  damage:      { index: 6, freqLow: 110, freqHigh: 480,  durLow: 0.10, durHigh: 0.60, wetLow: 0.10, wetHigh: 0.30, azMax: 45.0, level: 0.78, rooms: ['room', 'corridor', 'chamber'] },
+  environment: { index: 7, freqLow: 80,  freqHigh: 600,  durLow: 0.08, durHigh: 0.50, wetLow: 0.20, wetHigh: 0.45, azMax: 60.0, level: 0.70, rooms: ['corridor', 'hall', 'hangar', 'cavern'] },
+};
+const ZB_CATEGORY_ORDER = ['ui', 'pickup', 'movement', 'combat', 'impact', 'power', 'damage', 'environment'];
+
+// arch: glass | pad | arp | whoosh | impact | energy | mech.   dir: +1 rising, -1 falling, 0 hashed.
+const ZB_SOUNDS = {
+  navigate:   { category: 'ui', arch: 'glass',  styleIndex: 0, dir: 0,  label: 'Navigate' },
+  select:     { category: 'ui', arch: 'arp',    styleIndex: 1, dir: 1,  label: 'Select' },
+  back:       { category: 'ui', arch: 'pad',    styleIndex: 2, dir: -1, label: 'Back' },
+  pause:      { category: 'ui', arch: 'arp',    styleIndex: 3, dir: -1, label: 'Pause' },
+  notify:     { category: 'ui', arch: 'pad',    styleIndex: 4, dir: 0,  label: 'Notify' },
+  error:      { category: 'ui', arch: 'energy', styleIndex: 5, dir: -1, label: 'Error' },
+  save:       { category: 'ui', arch: 'glass',  styleIndex: 6, dir: 0,  label: 'Save' },
+  ammo:       { category: 'pickup', arch: 'mech',   styleIndex: 0, dir: 0, label: 'Ammo' },
+  shield:     { category: 'pickup', arch: 'energy', styleIndex: 1, dir: 1, label: 'Shield' },
+  key:        { category: 'pickup', arch: 'glass',  styleIndex: 2, dir: 0, label: 'Key' },
+  health:     { category: 'pickup', arch: 'arp',    styleIndex: 3, dir: 1, label: 'Health' },
+  jump:       { category: 'movement', arch: 'whoosh', styleIndex: 0, dir: 1,  label: 'Jump' },
+  land:       { category: 'movement', arch: 'impact', styleIndex: 1, dir: 0,  label: 'Land' },
+  dash:       { category: 'movement', arch: 'whoosh', styleIndex: 2, dir: 1,  label: 'Dash' },
+  footstep:   { category: 'movement', arch: 'impact', styleIndex: 3, dir: 0,  label: 'Footstep' },
+  roll:       { category: 'movement', arch: 'whoosh', styleIndex: 4, dir: -1, label: 'Roll' },
+  melee:      { category: 'combat', arch: 'whoosh', styleIndex: 0, dir: -1, label: 'Melee' },
+  gunshot:    { category: 'combat', arch: 'impact', styleIndex: 1, dir: 0,  label: 'Gunshot' },
+  plasma:     { category: 'combat', arch: 'energy', styleIndex: 2, dir: -1, label: 'Plasma' },
+  reload:     { category: 'combat', arch: 'mech',   styleIndex: 3, dir: 0,  label: 'Reload' },
+  ricochet:   { category: 'combat', arch: 'energy', styleIndex: 4, dir: -1, label: 'Ricochet' },
+  shieldHit:  { category: 'combat', arch: 'glass',  styleIndex: 5, dir: 0,  label: 'Shield hit' },
+  explosion:  { category: 'impact', arch: 'impact', styleIndex: 0, dir: 0, label: 'Explosion' },
+  crash:      { category: 'impact', arch: 'mech',   styleIndex: 1, dir: 0, label: 'Crash' },
+  thud:       { category: 'impact', arch: 'impact', styleIndex: 2, dir: 0, label: 'Thud' },
+  glassBreak: { category: 'impact', arch: 'glass',  styleIndex: 3, dir: 0, label: 'Glass break' },
+  powerUp:    { category: 'power', arch: 'arp',    styleIndex: 0, dir: 1, label: 'Power up' },
+  levelUp:    { category: 'power', arch: 'arp',    styleIndex: 1, dir: 1, label: 'Level up' },
+  recharge:   { category: 'power', arch: 'energy', styleIndex: 2, dir: 1, label: 'Recharge' },
+  charge:     { category: 'power', arch: 'energy', styleIndex: 3, dir: 1, label: 'Charge' },
+  checkpoint: { category: 'power', arch: 'glass',  styleIndex: 4, dir: 0, label: 'Checkpoint' },
+  hurt:       { category: 'damage', arch: 'energy', styleIndex: 0, dir: -1, label: 'Hurt' },
+  death:      { category: 'damage', arch: 'arp',    styleIndex: 1, dir: -1, label: 'Death' },
+  alarm:      { category: 'damage', arch: 'arp',    styleIndex: 2, dir: 1,  label: 'Alarm' },
+  warning:    { category: 'damage', arch: 'pad',    styleIndex: 3, dir: 0,  label: 'Warning' },
+  door:       { category: 'environment', arch: 'whoosh', styleIndex: 0, dir: -1, label: 'Door' },
+  terminal:   { category: 'environment', arch: 'arp',    styleIndex: 1, dir: 1,  label: 'Terminal' },
+  splash:     { category: 'environment', arch: 'whoosh', styleIndex: 2, dir: -1, label: 'Splash' },
+  teleport:   { category: 'environment', arch: 'energy', styleIndex: 3, dir: 1,  label: 'Teleport' },
+  switch:     { category: 'environment', arch: 'mech',   styleIndex: 4, dir: 0,  label: 'Switch' },
+};
+const ZS_ARCHETYPES = ['glass', 'pad', 'arp', 'whoosh', 'impact', 'energy', 'mech'];
+const ZS_ARP_PATTERNS = [[0, 4, 7, 12, 16], [0, 7, 12, 19, 24], [0, 5, 7, 12, 17],
+  [0, 3, 7, 10, 15], [0, 12, 7, 12, 19], [0, 6, 0, 6, 0], [0, 2, 4, 7, 9], [0, 12, 0, 12, 0]];
+const ZS_FM_RATIOS = [1.0, 2.0, 3.0, 3.5, 4.0, 5.0, 7.0, 0.5, 1.5, 2.5];
+const ZS_WAVE_SHAPES = ['saw', 'pulse', 'tri', 'organ', 'glass', 'soft', 'formant'];
+const ZS_WAVE_CYCLES = [1024, 512, 256, 128, 64];
+const ZS_FM_CYCLES = [512, 256, 128, 64];
+const ZS_FMAX = 6000.0;              // highest fundamental a tonal voice may reach, Hz
+// Partial ratios. bar, membrane and tube are the textbook ideal cases; shard is invented.
+const ZS_MATERIALS = {
+  bar:      [1.0, 2.756, 5.404, 8.933, 13.344, 18.64],
+  membrane: [1.0, 1.594, 2.136, 2.296, 2.653, 2.918],
+  tube:     [1.0, 3.0, 5.0, 7.0, 9.0, 11.0],
+  shard:    [1.0, 1.71, 2.89, 3.94, 5.33, 7.12],
+};
+const ZS_MATERIAL_ORDER = ['bar', 'membrane', 'tube', 'shard'];
+
+// Amplitude-envelope (EG1) families, seconds. decay and release are the time to fall 96 dB.
+const ZS_ENV = {
+  perc:  { attack: [0.001, 0.006], hold: [0.0, 0.010], decay: [0.25, 0.90], sustain: [0.0, 0.0],   release: [0.10, 0.35] },
+  pluck: { attack: [0.001, 0.004], hold: [0.0, 0.005], decay: [0.50, 1.60], sustain: [0.0, 0.20],  release: [0.20, 0.60] },
+  sus:   { attack: [0.006, 0.050], hold: [0.0, 0.0],   decay: [0.30, 0.90], sustain: [0.55, 0.90], release: [0.10, 0.40] },
+  swell: { attack: [0.050, 0.220], hold: [0.0, 0.0],   decay: [0.40, 1.00], sustain: [0.60, 0.90], release: [0.20, 0.60] },
+  hit:   { attack: [0.0005, 0.002], hold: [0.0, 0.004], decay: [0.06, 0.22], sustain: [0.0, 0.0],  release: [0.04, 0.10] },
+  tail:  { attack: [0.002, 0.012], hold: [0.0, 0.020], decay: [0.80, 2.40], sustain: [0.0, 0.0],   release: [0.40, 1.00] },
+};
+// Reverb environments in I3DL2 terms. These are this project's own values, set in the
+// neighbourhood of the standard environment presets; they are not copies of that table.
+const ZS_ROOMS = {
+  room:     { decay: 0.40, hfRatio: 0.83, reflDb: -5.0, reflDelay: 0.002, revDb: 2.0, revDelay: 0.003, diffusion: 1.00, density: 1.00, inLp: 0.70 },
+  corridor: { decay: 1.00, hfRatio: 0.59, reflDb: -4.0, reflDelay: 0.007, revDb: 3.0, revDelay: 0.011, diffusion: 1.00, density: 0.80, inLp: 0.75 },
+  chamber:  { decay: 1.50, hfRatio: 0.64, reflDb: -2.0, reflDelay: 0.012, revDb: 2.0, revDelay: 0.017, diffusion: 0.90, density: 1.00, inLp: 0.80 },
+  hall:     { decay: 2.00, hfRatio: 0.70, reflDb: -6.0, reflDelay: 0.020, revDb: 2.0, revDelay: 0.029, diffusion: 1.00, density: 1.00, inLp: 0.70 },
+  hangar:   { decay: 2.40, hfRatio: 0.35, reflDb: -2.0, reflDelay: 0.020, revDb: 4.0, revDelay: 0.030, diffusion: 0.85, density: 0.70, inLp: 0.45 },
+  cavern:   { decay: 2.60, hfRatio: 0.90, reflDb: -1.0, reflDelay: 0.015, revDb: 1.0, revDelay: 0.022, diffusion: 0.80, density: 0.90, inLp: 0.95 },
+};
+const ZS_ROOM_ORDER = ['room', 'corridor', 'chamber', 'hall', 'hangar', 'cavern'];
+
+// ---------------------------------------------------------------------------
+// 4. PARAMETER DERIVATION  (world -> category -> sound -> layer -> slot)
+// ---------------------------------------------------------------------------
+function zsDeriveEg1(h, family) {
+  const e = ZS_ENV[family];
+  return {
+    delay: 0.0,
+    attack: zbRange(h(20), e.attack[0], e.attack[1]),
+    hold: zbRange(h(21), e.hold[0], e.hold[1]),
+    decay: zbRange(h(22), e.decay[0], e.decay[1]),
+    sustain: zbRange(h(23), e.sustain[0], e.sustain[1]),
+    release: zbRange(h(24), e.release[0], e.release[1]),
+  };
+}
+
+function zsDeriveSource(kind, h, seed, fmax, o) {
+  if (kind === 'wave') {
+    let cycle = 64;
+    for (const c of ZS_WAVE_CYCLES) if (fmax * c / ZS_SR <= 8.0) { cycle = c; break; }
+    let hcap = Math.floor(0.45 * ZS_SR / fmax);
+    if (hcap > (cycle >> 1) - 1) hcap = (cycle >> 1) - 1;
+    let harm = zbPick(h(13), [12, 24, 48, 96]);
+    if (harm > hcap) harm = hcap;
+    if (harm < 1) harm = 1;
+    const shape = o.shape !== undefined ? o.shape : zbPick(h(11), ZS_WAVE_SHAPES);
+    return { kind: 'wave', cycle, shape, duty: zbRange(h(12), 0.125, 0.5), harmonics: harm,
+      formant: zbRange(h(14), 3.0, 14.0), seed };
+  }
+  if (kind === 'fm') {
+    let cycle = 64;
+    for (const c of ZS_FM_CYCLES) if (fmax * c / ZS_SR <= 4.0) { cycle = c; break; }
+    let cands = ZS_FM_RATIOS.filter((r) => r * fmax <= 9000.0);
+    if (cands.length === 0) cands = [1.0];
+    const ratio = zbPick(h(11), cands);
+    let index0 = zbRange(h(12), 1.0, 6.0);
+    let icap = (18000.0 / fmax - 1.0) / ratio;        // keep the widest sideband under 18 kHz
+    if (icap < 0.3) icap = 0.3;
+    if (index0 > icap) index0 = icap;
+    let indexLoop = zbRange(h(13), 0.1, 1.0);
+    if (indexLoop > index0) indexLoop = index0;
+    return { kind: 'fm', cycle, ratio, index0, indexLoop, attackCycles: 2 * zbInt(h(14), 3, 24), seed };
+  }
+  if (kind === 'noise') {
+    return { kind: 'noise', length: 16384, color: zbRange(h(11), 0.10, 1.0), seed };
+  }
+  if (kind === 'modal') {
+    const material = o.material !== undefined ? o.material : zbPick(h(11), ZS_MATERIAL_ORDER);
+    return { kind: 'modal', material, f0: zbRange(h(12), 180.0, 700.0), t60: zbRange(h(13), 0.12, 0.50),
+      tilt: zbRange(h(14), 0.2, 1.2), damp: zbRange(h(15), 0.3, 1.5), partials: zbInt(h(16), 4, 6), seed };
+  }
+  return { kind: 'thump', length: Math.floor(zbRange(h(11), 0.12, 0.35) * ZS_SR),
+    f1: zbRange(h(12), 90.0, 260.0), f2: zbRange(h(13), 30.0, 60.0), seed };
+}
+
+function zsDerive(name, category, arch, styleIndex, dirIn, worldSeed) {
+  const cat = ZB_CATEGORIES[category];
+  const catSeed = zbHash(cat.index, worldSeed);
+  const soundSeed = zbHash(styleIndex, catSeed);
+  const hs = (k) => zbHash(100 + k, soundSeed);
+
+  const baseFreq = zbRange(hs(0), cat.freqLow, cat.freqHigh);
+  const hold = zbRange(hs(1), cat.durLow, cat.durHigh);
+  const reverb = { room: zbPick(hs(2), cat.rooms), wet: zbRange(hs(3), cat.wetLow, cat.wetHigh) };
+  let direction = dirIn;
+  if (direction === 0) direction = (hs(7) & 1) ? 1 : -1;
+  const az = zbRange(hs(9), -cat.azMax, cat.azMax);
+
+  function layer(i, kind, role, family, o) {
+    const seed = zbHash(i + 1, soundSeed);
+    const h = (k) => zbHash(k, seed);
+    const notes = o.notes !== undefined ? o.notes : [{ t: 0.0, ratio: 1.0, gain: 1.0 }];
+    const peg = o.pegOct !== undefined ? o.pegOct : 0.0;
+    const vib = o.vibOct !== undefined ? o.vibOct : 0.0;
+    const hasFreq = o.freq !== undefined;
+    let freq = null;
+    let fmax = 0.0;
+    if (hasFreq) {
+      let top = 0.0;
+      for (const nt of notes) if (nt.ratio > top) top = nt.ratio;
+      top = top * dexp2((peg > 0.0 ? peg : 0.0) + vib);
+      freq = o.freq;
+      if (freq > ZS_FMAX / top) freq = ZS_FMAX / top;
+      fmax = freq * top;
+    }
+    const source = zsDeriveSource(kind, h, seed, fmax, o);
+    let step0;
+    if (!hasFreq) step0 = o.step0;
+    else if (kind === 'modal') {
+      step0 = freq / source.f0;
+      if (step0 > 4.0) step0 = 4.0;
+      if (step0 < 0.25) step0 = 0.25;
+    } else step0 = freq * source.cycle / ZS_SR;
+    const hd = o.hold !== undefined ? o.hold : hold;
+    const eg1 = zsDeriveEg1(h, family);
+    if (o.delay !== undefined) eg1.delay = o.delay;
+    const eg2 = o.eg2 !== undefined ? o.eg2 : { attack: 0.0, decay: zbRange(h(25), 0.05, 0.40), sustain: 0.0, release: 0.10 };
+    const flt = o.filter !== undefined ? o.filter : { on: false, cutoff: 8000.0, resDb: 0.0, egOct: 0.0, lfoOct: 0.0 };
+    const fmtPool = (kind === 'noise' || kind === 'thump') ? ['adpcm', 'adpcm', 'pcm16'] : ['pcm16', 'pcm16', 'adpcm'];
+    const az0 = o.az !== undefined ? o.az : 0.0;
+    const az1 = o.azTo !== undefined ? o.azTo : az0;
+    return {
+      role, source, format: zbPick(h(27), fmtPool),
+      freq, step0, notes, hold: hd,
+      eg1, eg2,
+      pegReg: zsRnd(peg * 128.0),               // EG2 -> pitch, in units of 32/4096 octave
+      filter: flt,
+      lfo: { rate: o.lfoRate !== undefined ? o.lfoRate : zbRange(h(30), 4.0, 9.0),
+        delay: o.lfoDelay !== undefined ? o.lfoDelay : 0.0, pitchOct: vib, trem: o.trem !== undefined ? o.trem : 0.0 },
+      vol: o.vol !== undefined ? o.vol : 0.5,
+      az0, az1, moveTime: o.moveTime !== undefined ? o.moveTime : hd,
+      send: o.send !== undefined ? o.send : 1.0,
+    };
+  }
+  // EG2 shape that climbs 0 -> 1 over t seconds and stays there
+  const rise = (t) => ({ attack: t > 0.004 ? t : 0.004, decay: 1.0, sustain: 1.0, release: 0.25 });
+  // EG2 shape that starts at 1 and falls to 0 over t seconds
+  const fall = (t) => ({ attack: 0.0, decay: t > 0.004 ? t : 0.004, sustain: 0.0, release: 0.10 });
+
+  const L = [];
+  if (arch === 'glass') {
+    const bright = zbRange(hs(10), 2.5, 7.0);
+    const ft = zbRange(hs(11), 0.08, 0.45);
+    L.push(layer(0, 'fm', 'body', 'pluck', {
+      freq: baseFreq, vol: 0.50, az, vibOct: zbRange(hs(12), 0.0, 0.004), eg2: fall(ft),
+      filter: { on: true, cutoff: baseFreq * bright, resDb: zbRange(hs(13), 2.0, 10.0),
+        egOct: zbRange(hs(14), 0.5, 2.0), lfoOct: 0.0 } }));
+    L.push(layer(1, 'fm', 'shimmer', 'pluck', {
+      freq: baseFreq * zbPick(hs(15), [2.0, 2.0, 3.0, 1.5, 4.0]) * (1.0 + zbRange(hs(16), 0.002, 0.007)),
+      vol: 0.20, az: -az }));
+    L.push(layer(2, 'wave', 'air', 'pluck', {
+      freq: baseFreq * zbPick(hs(17), [4.0, 5.0, 6.0, 8.0]), shape: 'glass',
+      vol: 0.08, az: az * 0.5, delay: zbRange(hs(18), 0.0, 0.02) }));
+    L.push(layer(3, 'wave', 'sub', 'perc', { freq: baseFreq * 0.5, shape: 'sine', vol: 0.26, send: 0.3 }));
+  } else if (arch === 'pad') {
+    const peg = direction * zbRange(hs(10), 0.0, 0.4);
+    const det = zbRange(hs(11), 0.004, 0.011);
+    const openOct = zbRange(hs(12), 0.8, 2.5);
+    const f = { on: true, cutoff: baseFreq * zbRange(hs(13), 1.5, 4.0), resDb: zbRange(hs(14), 4.0, 14.0),
+      egOct: openOct, lfoOct: zbRange(hs(15), 0.0, 0.5) };
+    const e2 = direction > 0 ? rise(hold * zbRange(hs(16), 0.3, 1.0)) : fall(hold * zbRange(hs(16), 0.6, 2.0));
+    L.push(layer(0, 'wave', 'body', 'sus', { freq: baseFreq, vol: 0.42, az, pegOct: peg, eg2: e2, filter: f }));
+    L.push(layer(1, 'wave', 'chorus', 'sus', { freq: baseFreq * (1.0 + det), vol: 0.30, az: -az, pegOct: peg, eg2: e2, filter: f }));
+    L.push(layer(2, 'wave', 'sub', 'sus', { freq: baseFreq * 0.5, shape: 'sine', vol: 0.24, pegOct: peg, eg2: e2, send: 0.3 }));
+  } else if (arch === 'arp') {
+    const pat = zbPick(hs(5), ZS_ARP_PATTERNS);
+    const count = zbInt(hs(4), 2, pat.length);
+    const gap = zbRange(hs(6), 0.045, 0.11);
+    const notes = [];
+    for (let i = 0; i < count; i++) notes.push({ t: i * gap, ratio: dexp2(direction * pat[i] / 12.0), gain: 1.0 });
+    const kind = (hs(8) & 1) ? 'fm' : 'wave';
+    const noteHold = hold < gap * 1.5 ? hold : gap * 1.5;
+    const f = { on: true, cutoff: baseFreq * zbRange(hs(10), 2.0, 6.0), resDb: zbRange(hs(11), 3.0, 12.0),
+      egOct: zbRange(hs(12), 0.5, 2.5), lfoOct: 0.0 };
+    const e2 = fall(zbRange(hs(13), 0.04, 0.20));
+    L.push(layer(0, kind, 'body', 'perc', { freq: baseFreq, vol: 0.36, az, hold: noteHold, notes, eg2: e2, filter: f }));
+    L.push(layer(1, kind === 'fm' ? 'wave' : 'fm', 'octave', 'perc', { freq: baseFreq * 2.0, vol: 0.14, az: -az, hold: noteHold, notes }));
+    L.push(layer(2, 'wave', 'wash', 'swell', { freq: baseFreq * (direction > 0 ? 0.5 : 1.0), shape: 'soft', vol: 0.12,
+      hold: (count - 1) * gap + noteHold, az: az * 0.3 }));
+  } else if (arch === 'whoosh') {
+    const sweep = zbRange(hs(10), 1.5, 3.5);
+    const start = direction > 0 ? zbRange(hs(11), 250.0, 700.0) : zbRange(hs(11), 2500.0, 7000.0);
+    const frac = zbRange(hs(12), 0.7, 1.6);
+    const res = zbRange(hs(13), 6.0, 16.0);
+    const wide = az + ((hs(14) & 1) ? 60.0 : -60.0);
+    const st = zbRange(hs(15), 0.6, 1.6);
+    const e2 = rise(hold * frac);
+    L.push(layer(0, 'noise', 'body', 'swell', {
+      step0: st, vol: 0.55, az: -wide, azTo: wide, moveTime: hold * 1.5, eg2: e2,
+      filter: { on: true, cutoff: start, resDb: res, egOct: direction * sweep, lfoOct: 0.0 } }));
+    L.push(layer(1, 'noise', 'width', 'swell', {
+      step0: st * zbRange(hs(16), 0.5, 0.8), vol: 0.32, az: wide * 0.6, azTo: -wide * 0.6, moveTime: hold * 1.5, eg2: e2,
+      filter: { on: true, cutoff: start * 0.6, resDb: res * 0.5, egOct: direction * sweep, lfoOct: 0.0 } }));
+    L.push(layer(2, (hs(17) & 1) ? 'fm' : 'wave', 'tone', 'swell', {
+      freq: baseFreq, vol: 0.16, az, pegOct: direction * zbRange(hs(18), 0.4, 1.4), eg2: e2, send: 0.6 }));
+  } else if (arch === 'impact') {
+    const big = hold >= 0.15;
+    const k = big ? 0.5 : 1.0;
+    L.push(layer(0, 'noise', 'crack', big ? 'tail' : 'hit', {
+      step0: zbRange(hs(10), 0.8, 2.0) * k, vol: 0.50, az, eg2: fall(zbRange(hs(11), 0.03, 0.20)),
+      filter: { on: true, cutoff: zbRange(hs(12), 500.0, 2500.0) * k, resDb: zbRange(hs(13), 0.0, 8.0),
+        egOct: zbRange(hs(14), 1.0, 3.0), lfoOct: 0.0 } }));
+    L.push(layer(1, 'modal', 'body', 'perc', { freq: baseFreq * zbRange(hs(15), 1.5, 4.0), vol: 0.42, az: az * 0.6,
+      hold: hold > 0.12 ? hold : 0.12 }));
+    L.push(layer(2, 'thump', 'sub', 'perc', { step0: zbRange(hs(16), 0.6, 1.2) * (big ? 0.7 : 1.0), vol: 0.72, send: big ? 0.5 : 0.25,
+      hold: hold > 0.15 ? hold : 0.15 }));
+    if (big) {
+      L.push(layer(3, 'noise', 'debris', 'tail', {
+        step0: zbRange(hs(17), 0.3, 0.8), vol: 0.42, az: -az, azTo: az, moveTime: 1.0, eg2: fall(zbRange(hs(18), 0.3, 1.2)),
+        filter: { on: true, cutoff: zbRange(hs(19), 250.0, 900.0), resDb: 2.0, egOct: zbRange(hs(20), 1.0, 2.5), lfoOct: 0.0 } }));
+    }
+  } else if (arch === 'energy') {
+    const peg = direction * zbRange(hs(10), 0.7, 2.5);
+    const frac = zbRange(hs(11), 0.6, 1.2);
+    const kind = (hs(12) & 1) ? 'fm' : 'wave';
+    const rate = zbRange(hs(13), 5.0, 30.0);
+    const vib = zbRange(hs(14), 0.0, 0.08);
+    const e2 = rise(hold * frac);
+    const f = { on: true, cutoff: baseFreq * zbRange(hs(15), 1.5, 5.0), resDb: zbRange(hs(16), 6.0, 18.0),
+      egOct: peg * zbRange(hs(17), 0.6, 1.2), lfoOct: zbRange(hs(18), 0.0, 0.8) };
+    L.push(layer(0, kind, 'carrier', 'sus', { freq: baseFreq, vol: 0.46, az, pegOct: peg, vibOct: vib, lfoRate: rate,
+      eg2: e2, filter: f, trem: zbRange(hs(19), 0.0, 0.5) }));
+    L.push(layer(1, kind, 'chorus', 'sus', { freq: baseFreq * (1.0 + zbRange(hs(20), 0.004, 0.012)), vol: 0.24, az: -az,
+      pegOct: peg, vibOct: vib, lfoRate: rate, eg2: e2, filter: f }));
+    L.push(layer(2, 'wave', 'sub', 'sus', { freq: baseFreq * 0.5, shape: 'sine', vol: 0.26, pegOct: peg, eg2: e2, send: 0.3 }));
+    L.push(layer(3, 'noise', 'fizz', 'swell', {
+      step0: zbRange(hs(21), 1.0, 2.0), vol: 0.07, az: az * 0.5, eg2: e2,
+      filter: { on: true, cutoff: direction > 0 ? 1500.0 : 6000.0, resDb: 6.0, egOct: direction * 2.0, lfoOct: 0.0 } }));
+  } else { // mech
+    const count = zbInt(hs(10), 2, 4);
+    const notes = [];
+    let t = 0.0;
+    for (let i = 0; i < count; i++) {
+      notes.push({ t, ratio: zbRange(hs(30 + i), 0.7, 1.5), gain: i === count - 1 ? 1.0 : zbRange(hs(40 + i), 0.5, 0.9) });
+      t = t + zbRange(hs(50 + i), 0.035, 0.035 + hold * 0.6);
+    }
+    const last = notes[count - 1].t;
+    L.push(layer(0, 'noise', 'click', 'hit', {
+      step0: zbRange(hs(11), 0.8, 1.8), vol: 0.42, az, hold: 0.01, notes, eg2: fall(zbRange(hs(12), 0.01, 0.05)),
+      filter: { on: true, cutoff: zbRange(hs(13), 900.0, 3000.0), resDb: zbRange(hs(14), 4.0, 12.0),
+        egOct: zbRange(hs(15), 0.5, 1.4), lfoOct: 0.0 } }));
+    L.push(layer(1, 'modal', 'clank', 'perc', { freq: baseFreq * zbRange(hs(16), 2.0, 5.0), vol: 0.40, az: -az * 0.5,
+      hold: 0.06, notes }));
+    L.push(layer(2, 'thump', 'weight', 'perc', { step0: zbRange(hs(17), 0.9, 1.6), vol: 0.40, hold: 0.08, send: 0.3,
+      notes: [{ t: last, ratio: 1.0, gain: 1.0 }] }));
+    L.push(layer(3, 'wave', 'servo', 'sus', { freq: baseFreq, vol: 0.10, az, hold: last > 0.04 ? last : 0.04,
+      pegOct: direction * zbRange(hs(18), 0.2, 1.0), eg2: rise(last), send: 0.6 }));
+  }
+
+  return { name, category, archetype: arch, direction, worldSeed: worldSeed >>> 0, soundSeed,
+    baseFreq, hold, azimuth: az, level: cat.level, reverb, layers: L };
+}
+
+// Named sound -> patch. O(1), pure.
+function zbDeriveParams(name, worldSeed = ZS_DEFAULT_SEED) {
+  const s = ZB_SOUNDS[name];
+  if (!s) throw new Error(`Unknown sound: ${name}`);
+  return zsDerive(name, s.category, s.arch, s.styleIndex, s.dir, worldSeed >>> 0);
+}
+
+// Unnamed sound at position n of the infinite patch space.
+function zbRandomize(n, worldSeed = ZS_DEFAULT_SEED) {
+  const v = zbHash(n, (worldSeed ^ 0x5A5A5A5A) >>> 0);
+  const category = ZB_CATEGORY_ORDER[zbInt(zbHash(0, v), 0, 7)];
+  const arch = ZS_ARCHETYPES[zbInt(zbHash(1, v), 0, 6)];
+  return zsDerive(`patch#${n}`, category, arch, 1000 + (v & 0xFFFF), 0, worldSeed >>> 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5. PROCEDURAL SOURCE SAMPLES (16-bit, written at 48 kHz)
+// ---------------------------------------------------------------------------
+function zsWaveAmp(src, k) {
+  const jit = 0.85 + 0.3 * zbFloat(zbHash(300 + k, src.seed));
+  let a;
+  if (src.shape === 'sine') return k === 1 ? 1.0 : 0.0;
+  if (src.shape === 'saw') a = 1.0 / k;
+  else if (src.shape === 'pulse') a = dsin(ZS_PI * k * src.duty) / k;
+  else if (src.shape === 'tri') a = k % 2 === 0 ? 0.0 : ((k >> 1) % 2 === 0 ? 1.0 : -1.0) / (k * k);
+  else if (src.shape === 'organ') a = [1, 2, 3, 4, 6, 8].includes(k) ? zbRange(zbHash(200 + k, src.seed), 0.2, 1.0) : 0.0;
+  else if (src.shape === 'glass') a = [1, 3, 4, 7, 9, 13].includes(k) ? 1.0 / k : 0.0;
+  else if (src.shape === 'soft') a = 1.0 / (k * k);
+  else { const d = (k - src.formant) / 2.0; a = (1.0 + 4.0 / (1.0 + d * d)) / k; }   // saw with one resonant bump
+  return a * jit;
+}
+
+// -> { pcm: Int32Array, loopStart: number (-1 = one-shot) }
+function zsGenSource(src) {
+  if (src.kind === 'wave') {
+    const P = src.cycle;
+    const tab = new Float64Array(P);
+    for (let m = 0; m < P; m++) tab[m] = dsin(ZS_TWO_PI * m / P);
+    const y = new Float64Array(P);
+    for (let k = 1; k <= src.harmonics; k++) {
+      const a = zsWaveAmp(src, k);
+      if (a !== 0.0) for (let n = 0; n < P; n++) y[n] = y[n] + a * tab[(k * n) % P];
+    }
+    let peak = 0.0;
+    for (let n = 0; n < P; n++) { const v = y[n] >= 0.0 ? y[n] : -y[n]; if (v > peak) peak = v; }
+    const out = new Int32Array(P);
+    for (let n = 0; n < P; n++) out[n] = zsRnd(26000.0 * y[n] / peak);
+    return { pcm: out, loopStart: 0 };
+  }
+  if (src.kind === 'fm') {
+    const P = src.cycle, nAtt = src.attackCycles * P, N = nAtt + 2 * P;
+    const out = new Int32Array(N);
+    for (let n = 0; n < N; n++) {
+      const t = n < nAtt ? 1.0 - n / nAtt : 0.0;
+      const idx = src.indexLoop + (src.index0 - src.indexLoop) * (t * t);
+      const ph = ZS_TWO_PI * n / P;
+      out[n] = zsRnd(26000.0 * dsin(ph + idx * dsin(src.ratio * ph)));
+    }
+    return { pcm: out, loopStart: nAtt };
+  }
+  if (src.kind === 'noise') {
+    const N = src.length;
+    const y = new Float64Array(N);
+    let z = 0.0, peak = 0.0;
+    for (let n = 0; n < N; n++) {
+      const w = zbFloat(zbHash(n, src.seed)) * 2.0 - 1.0;   // O(1) white noise
+      z = z + src.color * (w - z);                          // one-pole colour
+      y[n] = z;
+      const v = z >= 0.0 ? z : -z;
+      if (v > peak) peak = v;
+    }
+    const out = new Int32Array(N);
+    for (let n = 0; n < N; n++) out[n] = zsRnd(24000.0 * y[n] / peak);
+    return { pcm: out, loopStart: 0 };
+  }
+  if (src.kind === 'modal') {
+    const t60 = src.t60;
+    const N = Math.floor(t60 * 1.25 * ZS_SR);
+    const ratios = ZS_MATERIALS[src.material];
+    const y = new Float64Array(N);
+    for (let j = 0; j < src.partials; j++) {
+      const f = src.f0 * ratios[j] * (0.97 + 0.06 * zbFloat(zbHash(400 + j, src.seed)));
+      if (f * 4.0 > 20000.0) continue;
+      const a = 1.0 / (1.0 + j * src.tilt);
+      const r = dexp2(-(3.0 * ZS_LOG2_10) / (t60 / (1.0 + j * src.damp) * ZS_SR));
+      const w = ZS_TWO_PI * f / ZS_SR;
+      let env = a;
+      for (let n = 0; n < N; n++) { y[n] = y[n] + env * dsin(w * n); env = env * r; }
+    }
+    let peak = 0.0;
+    for (let n = 0; n < N; n++) { const v = y[n] >= 0.0 ? y[n] : -y[n]; if (v > peak) peak = v; }
+    const out = new Int32Array(N);
+    for (let n = 0; n < N; n++) {
+      const fade = N - n < 64 ? (N - n) / 64.0 : 1.0;
+      out[n] = zsRnd(28000.0 * y[n] / peak * fade);
+    }
+    return { pcm: out, loopStart: -1 };
+  }
+  // thump: sine whose pitch falls f1 -> f2, phase integrated in closed form
+  const N = src.length;
+  const c1 = src.f1 / ZS_SR, c2 = src.f2 / ZS_SR;
+  const out = new Int32Array(N);
+  for (let n = 0; n < N; n++) {
+    const t = 1.0 - n / N, t2 = t * t;
+    const ph = ZS_TWO_PI * (c2 * n + (c1 - c2) * N * 0.25 * (1.0 - t2 * t2));
+    out[n] = zsRnd(28000.0 * (dsin(ph) * t2));
+  }
+  return { pcm: out, loopStart: -1 };
+}
+
+// ---------------------------------------------------------------------------
+// 6. XBOX ADPCM (IMA ADPCM in 36-byte blocks: 4-byte header + 64 nibbles = 65 samples)
+// ---------------------------------------------------------------------------
+const ZS_IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+  50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+  253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+  1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+  3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487,
+  12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+const ZS_IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8];
+
+// Encode then decode. -> { pcm: Int32Array, bytes: number }
+function zsAdpcmCodec(s) {
+  const N = s.length;
+  const out = new Int32Array(N);
+  let index = 0, blocks = 0;
+  for (let b = 0; b < N; b += 65) {
+    blocks++;
+    let pred = s[b];                 // the block header carries the first sample verbatim
+    out[b] = pred;
+    const end = b + 65 < N ? b + 65 : N;
+    for (let i = b + 1; i < end; i++) {
+      const step = ZS_IMA_STEP[index];
+      let diff = s[i] - pred;
+      let nib = 0;
+      if (diff < 0) { nib = 8; diff = -diff; }
+      let d = step >> 3;
+      if (diff >= step) { nib |= 4; diff -= step; d += step; }
+      if (diff >= (step >> 1)) { nib |= 2; diff -= step >> 1; d += step >> 1; }
+      if (diff >= (step >> 2)) { nib |= 1; d += step >> 2; }
+      pred = (nib & 8) ? pred - d : pred + d;
+      if (pred > 32767) pred = 32767; else if (pred < -32768) pred = -32768;
+      index += ZS_IMA_INDEX[nib & 7];
+      if (index < 0) index = 0; else if (index > 88) index = 88;
+      out[i] = pred;
+    }
+  }
+  return { pcm: out, bytes: blocks * 36 };
+}
+
+// ---------------------------------------------------------------------------
+// 7. VOICE: envelopes, LFO, pitch stepping, DLS2-form low-pass
+// ---------------------------------------------------------------------------
+// Amplitude envelope before key-off, 0..1.
+function zsEg1Pre(e, t) {
+  t = t - e.delay;
+  if (t < 0.0) return 0.0;
+  if (t < e.attack) return t / e.attack;
+  t = t - e.attack;
+  if (t < e.hold) return 1.0;
+  t = t - e.hold;
+  let db = 96.0 * t / e.decay;
+  const sus = 96.0 * (1.0 - e.sustain);
+  if (db > sus) db = sus;
+  return dexp2(-db * ZS_DB2OCT);
+}
+function zsEg1(e, t, T) {
+  if (t < T) return zsEg1Pre(e, t);
+  return zsEg1Pre(e, T) * dexp2(-(96.0 * (t - T) / e.release) * ZS_DB2OCT);
+}
+// Modulation envelope before key-off, 0..1, linear segments.
+function zsEg2Pre(e, t) {
+  if (t < e.attack) return t / e.attack;
+  const v = 1.0 - (t - e.attack) / e.decay;
+  return v > e.sustain ? v : e.sustain;
+}
+function zsEg2(e, t, T) {
+  if (t < T) return zsEg2Pre(e, t);
+  const v = zsEg2Pre(e, T) * (1.0 - (t - T) / e.release);
+  return v > 0.0 ? v : 0.0;
+}
+
+// One key-on of one voice -> { out: Float64Array, amp: Float64Array per frame, cuts: Float64Array | null }
+function zsRenderVoice(pcm, loopStart, layer, note) {
+  const T = layer.hold, e1 = layer.eg1, e2 = layer.eg2, lfo = layer.lfo, flt = layer.filter;
+  const F = Math.floor((T + e1.release) * ZS_FPS) + 1;
+  const n = F * ZS_FRAME;
+  const L = pcm.length;
+  const looped = loopStart >= 0;
+  const loopLen = L - loopStart;
+  const ext = new Int32Array(L + 5);
+  ext.set(pcm, 1);
+  if (looped) for (let i = 0; i < 4; i++) ext[L + 1 + i] = pcm[loopStart + i];
+  const base = layer.step0 * note.ratio;
+  const gain = layer.vol * note.gain;
+  const q = 0.7071067811865476 * dexp2(flt.resDb * ZS_DB2OCT);
+  const g = dexp2(-0.5 * flt.resDb * ZS_DB2OCT);
+  const filt = flt.on;
+
+  const amp = new Float64Array(F + 1);
+  const steps = new Float64Array(F);
+  const cb1 = new Float64Array(F), cb2 = new Float64Array(F), cK = new Float64Array(F);
+  const cuts = filt ? new Float64Array(F) : null;
+  for (let k = 0; k < F; k++) {
+    const t = k / 1500.0;
+    let lv = 0.0;
+    if (t >= lfo.delay) lv = dsin(ZS_TWO_PI * lfo.rate * (t - lfo.delay));
+    const m = zsEg2(e2, t, T);
+    amp[k] = zsEg1(e1, t, T) * (1.0 - lfo.trem * (0.5 + 0.5 * lv)) * gain;
+    const units = zsRnd(layer.pegReg * 32.0 * m + lfo.pitchOct * 4096.0 * lv);
+    let st = zsRnd(base * dexp2(units / 4096.0) * 65536.0);
+    if (st < 1) st = 1; else if (st > 1048576) st = 1048576;
+    steps[k] = st;
+    if (filt) {
+      let fc = flt.cutoff * dexp2(flt.egOct * m + flt.lfoOct * lv);
+      if (fc < 30.0) fc = 30.0; else if (fc > 8000.0) fc = 8000.0;
+      cuts[k] = fc;
+      const th = ZS_TWO_PI * fc / ZS_SR;
+      const r = dexp2(-(th / (2.0 * q)) / ZS_LN2);
+      const b1 = -2.0 * r * dsin(th + ZS_HALF_PI);
+      const b2 = r * r;
+      cb1[k] = b1; cb2[k] = b2; cK[k] = g * (1.0 + b1 + b2);
+    }
+  }
+  amp[F] = 0.0;
+
+  const out = new Float64Array(n);
+  let pos = 0, y1 = 0.0, y2 = 0.0, i = 0, done = false;
+  for (let k = 0; k < F && !done; k++) {
+    const st = steps[k], a = amp[k], da = (amp[k + 1] - a) / 32.0;
+    const b1 = cb1[k], b2 = cb2[k], K = cK[k];
+    for (let j = 0; j < 32; j++) {
+      let idx = Math.floor(pos / 65536);
+      if (idx > L) {
+        if (looped) { pos -= loopLen * 65536; idx -= loopLen; } else { done = true; break; }
+      }
+      const fr = (pos - idx * 65536) / 65536.0;
+      const s0 = ext[idx], s1 = ext[idx + 1], s2 = ext[idx + 2], s3 = ext[idx + 3];
+      const c1 = 0.5 * (s2 - s0);
+      const c2 = s0 - 2.5 * s1 + 2.0 * s2 - 0.5 * s3;
+      const c3 = 0.5 * (s3 - s0) + 1.5 * (s1 - s2);
+      let x = ((c3 * fr + c2) * fr + c1) * fr + s1;
+      if (filt) {
+        const y = K * x - b1 * y1 - b2 * y2;
+        y2 = y1; y1 = y; x = y;
+      }
+      out[i] = x * (a + da * j);
+      i++;
+      pos += st;
+    }
+  }
+  return { out, amp, cuts };
+}
+
+// ---------------------------------------------------------------------------
+// 8. 3D PLACEMENT: interaural delay, far-ear level drop and head shadow
+// ---------------------------------------------------------------------------
+const ZS_ITD = 48000.0 * 0.0875 / 343.0;     // head radius / speed of sound, in samples
+
+// mono -> { left, right }, 34 samples longer (rounded up to a whole frame)
+function zsSpatialise(mono, layer) {
+  const n = mono.length;
+  const F = Math.floor((n + 34 + ZS_FRAME - 1) / ZS_FRAME);
+  const total = F * ZS_FRAME;
+  const dl = new Float64Array(F + 1), dr = new Float64Array(F + 1), sh = new Float64Array(F + 1);
+  const az0 = layer.az0, az1 = layer.az1, mt = layer.moveTime;
+  for (let k = 0; k <= F; k++) {
+    let u = (k / 1500.0) / mt;
+    if (u > 1.0) u = 1.0;
+    const rad = (az0 + (az1 - az0) * u) * ZS_PI / 180.0;
+    const s = dsin(rad);
+    sh[k] = s;
+    dl[k] = ZS_ITD * ((rad > 0.0 ? rad : 0.0) + (s > 0.0 ? s : 0.0));
+    dr[k] = ZS_ITD * ((rad < 0.0 ? -rad : 0.0) + (s < 0.0 ? -s : 0.0));
+  }
+  const left = new Float64Array(total), right = new Float64Array(total);
+  let zl = 0.0, zr = 0.0, i = 0;
+  for (let k = 0; k < F; k++) {
+    const d0 = dl[k], dd0 = (dl[k + 1] - d0) / 32.0;
+    const d1 = dr[k], dd1 = (dr[k + 1] - d1) / 32.0;
+    const s0 = sh[k], ds = (sh[k + 1] - s0) / 32.0;
+    for (let j = 0; j < 32; j++) {
+      const s = s0 + ds * j;
+      const sp = s > 0.0 ? s : 0.0;
+      const sn = s < 0.0 ? -s : 0.0;
+      // left ear is the far ear when the source is to the right (s > 0)
+      let p = i - (d0 + dd0 * j);
+      let ip = Math.floor(p);
+      let f = p - ip;
+      let a = (ip >= 0 && ip < n) ? mono[ip] : 0.0;
+      let b = (ip >= -1 && ip < n - 1) ? mono[ip + 1] : 0.0;
+      let x = a + (b - a) * f;
+      zl = zl + (1.0 - 0.75 * sp) * (x - zl);
+      left[i] = zl * (1.0 - 0.5 * sp);
+      p = i - (d1 + dd1 * j);
+      ip = Math.floor(p);
+      f = p - ip;
+      a = (ip >= 0 && ip < n) ? mono[ip] : 0.0;
+      b = (ip >= -1 && ip < n - 1) ? mono[ip + 1] : 0.0;
+      x = a + (b - a) * f;
+      zr = zr + (1.0 - 0.75 * sn) * (x - zr);
+      right[i] = zr * (1.0 - 0.5 * sn);
+      i++;
+    }
+  }
+  return { left, right };
+}
+
+// ---------------------------------------------------------------------------
+// 9. I3DL2-PARAMETER REVERB (input low-pass -> 6 early taps -> 2 all-pass -> 4-line FDN)
+// ---------------------------------------------------------------------------
+const ZS_ER_TIMES = [0.0, 0.0031, 0.0057, 0.0089, 0.0127, 0.0173];
+const ZS_ER_GAINS = [1.0, 0.80, 0.70, 0.55, 0.45, 0.35];
+const ZS_FDN_LENS = [1847, 2311, 2797, 3251];
+
+function zsReverb(inp, roomName) {
+  const p = ZS_ROOMS[roomName];
+  const n = inp.length;
+  const refl = dexp2(p.reflDb * ZS_DB2OCT);
+  const rev = dexp2(p.revDb * ZS_DB2OCT);
+  const inLp = p.inLp;
+  const dens = 0.6 + 0.4 * p.density;
+  const taps = [];
+  for (let j = 0; j < 6; j++) taps.push(Math.floor((p.reflDelay + ZS_ER_TIMES[j] * dens) * ZS_SR) + 1);
+  const lateTap = Math.floor((p.reflDelay + p.revDelay) * ZS_SR) + 1;
+  let ringN = lateTap + 1;
+  for (let j = 0; j < 6; j++) if (taps[j] + 1 > ringN) ringN = taps[j] + 1;
+  const ring = new Float64Array(ringN);
+  let wr = 0;
+  const na1 = Math.floor(241 * dens), na2 = Math.floor(83 * dens);
+  const a1 = new Float64Array(na1), a2 = new Float64Array(na2);
+  let w1 = 0, w2 = 0;
+  const ga = 0.7 * p.diffusion;
+  const lens = [], gl = [], pl = [];
+  for (let j = 0; j < 4; j++) {
+    lens.push(Math.floor(ZS_FDN_LENS[j] * dens));
+    const gj = dexp2(-(3.0 * lens[j] / (p.decay * ZS_SR)) * ZS_LOG2_10);
+    const hj = dexp2(-(3.0 * lens[j] / (p.decay * p.hfRatio * ZS_SR)) * ZS_LOG2_10);
+    const rr = hj / gj;
+    gl.push(gj);
+    pl.push((1.0 - rr) / (1.0 + rr));
+  }
+  const l0 = new Float64Array(lens[0]), l1 = new Float64Array(lens[1]), l2 = new Float64Array(lens[2]), l3 = new Float64Array(lens[3]);
+  const n0 = lens[0], n1 = lens[1], n2 = lens[2], n3 = lens[3];
+  const g0 = gl[0], g1 = gl[1], g2 = gl[2], g3 = gl[3];
+  const p0 = pl[0], p1 = pl[1], p2 = pl[2], p3 = pl[3];
+  const q0 = 1.0 - p0, q1 = 1.0 - p1, q2 = 1.0 - p2, q3 = 1.0 - p3;
+  let i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+  let d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+  const t0 = taps[0], t1 = taps[1], t2 = taps[2], t3 = taps[3], t4 = taps[4], t5 = taps[5];
+  const e0 = ZS_ER_GAINS[0], e1 = ZS_ER_GAINS[1], e2 = ZS_ER_GAINS[2], e3 = ZS_ER_GAINS[3], e4 = ZS_ER_GAINS[4], e5 = ZS_ER_GAINS[5];
+  let lp = 0.0;
+  const outL = new Float64Array(n), outR = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    lp = lp + inLp * (inp[i] - lp);
+    ring[wr] = lp;
+    const erL = e0 * ring[(wr - t0 + ringN) % ringN] + e2 * ring[(wr - t2 + ringN) % ringN] + e4 * ring[(wr - t4 + ringN) % ringN];
+    const erR = e1 * ring[(wr - t1 + ringN) % ringN] + e3 * ring[(wr - t3 + ringN) % ringN] + e5 * ring[(wr - t5 + ringN) % ringN];
+    let v = ring[(wr - lateTap + ringN) % ringN];
+    wr++; if (wr === ringN) wr = 0;
+    let z = a1[w1], u = v - ga * z;
+    a1[w1] = u; v = u * ga + z;
+    w1++; if (w1 === na1) w1 = 0;
+    z = a2[w2]; u = v - ga * z;
+    a2[w2] = u; v = u * ga + z;
+    w2++; if (w2 === na2) w2 = 0;
+    d0 = l0[i0] * q0 + d0 * p0;
+    d1 = l1[i1] * q1 + d1 * p1;
+    d2 = l2[i2] * q2 + d2 * p2;
+    d3 = l3[i3] * q3 + d3 * p3;
+    const s = 0.5 * (d0 + d1 + d2 + d3);
+    l0[i0] = v + (d0 - s) * g0;
+    l1[i1] = v + (d1 - s) * g1;
+    l2[i2] = v + (d2 - s) * g2;
+    l3[i3] = v + (d3 - s) * g3;
+    i0++; if (i0 === n0) i0 = 0;
+    i1++; if (i1 === n1) i1 = 0;
+    i2++; if (i2 === n2) i2 = 0;
+    i3++; if (i3 === n3) i3 = 0;
+    outL[i] = refl * erL + rev * (d0 - d2);
+    outR[i] = refl * erR + rev * (d1 - d3);
+  }
+  return { outL, outR };
+}
+
+// ---------------------------------------------------------------------------
+// 10. RENDER
+// ---------------------------------------------------------------------------
+// patch -> { left, right: Int16Array, sampleRate, gain, peak, sampleBytes, layerEnvs, layerCuts }
+function zsRender(patch) {
+  const voices = [];
+  const layerEnvs = [], layerCuts = [];
+  let sampleBytes = 0, n = 0;
+  for (const layer of patch.layers) {
+    const raw = zsGenSource(layer.source);
+    let pcm = raw.pcm;
+    if (layer.format === 'adpcm') {
+      const codec = zsAdpcmCodec(pcm);
+      pcm = codec.pcm;
+      sampleBytes += codec.bytes;
+    } else sampleBytes += pcm.length * 2;
+    const parts = [];
+    let m = 0;
+    for (const note of layer.notes) {
+      const off = Math.floor(note.t * ZS_SR);
+      const v = zsRenderVoice(pcm, raw.loopStart, layer, note);
+      parts.push({ off, v });
+      if (off + v.out.length > m) m = off + v.out.length;
+    }
+    const mono = new Float64Array(m);
+    for (const { off, v } of parts) for (let i = 0; i < v.out.length; i++) mono[off + i] += v.out[i];
+    const sp = zsSpatialise(mono, layer);
+    voices.push({ mono, left: sp.left, right: sp.right, layer });
+    layerEnvs.push(parts[0].v.amp);
+    layerCuts.push(parts[0].v.cuts);
+    if (sp.left.length > n) n = sp.left.length;
+  }
+
+  const room = ZS_ROOMS[patch.reverb.room];
+  let tail = room.decay * 1.15 + room.reflDelay + room.revDelay;
+  if (tail > 3.0) tail = 3.0;
+  n += Math.floor(tail * ZS_SR) + 64;
+  const mixL = new Float64Array(n), mixR = new Float64Array(n), snd = new Float64Array(n);
+  for (const { mono, left, right, layer } of voices) {
+    for (let i = 0; i < left.length; i++) { mixL[i] += left[i]; mixR[i] += right[i]; }
+    const send = layer.send;
+    if (send > 0.0) for (let i = 0; i < mono.length; i++) snd[i] += mono[i] * send;
+  }
+  const wetOut = zsReverb(snd, patch.reverb.room);
+  const wet = patch.reverb.wet;
+  let peak = 0.0;
+  for (let i = 0; i < n; i++) {
+    let l = mixL[i] + wetOut.outL[i] * wet, r = mixR[i] + wetOut.outR[i] * wet;
+    mixL[i] = l; mixR[i] = r;
+    if (l < 0.0) l = -l;
+    if (r < 0.0) r = -r;
+    if (l > peak) peak = l;
+    if (r > peak) peak = r;
+  }
+  // Peak-normalise to the category level, as an asset pipeline would.
+  const gain = peak > 0.0 ? 32767.0 * 0.89 * patch.level / peak : 0.0;
+  let last = -1;
+  for (let i = 0; i < n; i++) {
+    const l = zsRnd(mixL[i] * gain), r = zsRnd(mixR[i] * gain);
+    mixL[i] = l; mixR[i] = r;
+    if (l > 12 || l < -12 || r > 12 || r < -12) last = i;
+  }
+  const end = last < 0 ? 1 : (last + 481 > n ? n : last + 481);
+  const left = new Int16Array(end), right = new Int16Array(end);
+  for (let i = 0; i < end; i++) { left[i] = mixL[i]; right[i] = mixR[i]; }
+  return { left, right, sampleRate: ZS_SR, gain, peak, sampleBytes, layerEnvs, layerCuts };
+}
+
+const ZS_CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+
+// CRC-32 of the interleaved little-endian int16 stream (matches zlib.crc32).
+function zsChecksum(r) {
+  let c = 0xFFFFFFFF;
+  const T = ZS_CRC_TABLE;
+  for (let i = 0; i < r.left.length; i++) {
+    const l = r.left[i] & 0xFFFF, q = r.right[i] & 0xFFFF;
+    c = T[(c ^ (l & 0xFF)) & 0xFF] ^ (c >>> 8);
+    c = T[(c ^ (l >>> 8)) & 0xFF] ^ (c >>> 8);
+    c = T[(c ^ (q & 0xFF)) & 0xFF] ^ (c >>> 8);
+    c = T[(c ^ (q >>> 8)) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function zsHex8(v) { return (v >>> 0).toString(16).toUpperCase().padStart(8, '0'); }
+
+// render -> Uint8Array holding a 16-bit stereo RIFF/WAVE file
+function zsEncodeWav(r) {
+  const n = r.left.length, bytes = new Uint8Array(44 + n * 4), dv = new DataView(bytes.buffer);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) bytes[o + i] = s.charCodeAt(i); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + n * 4, true); str(8, 'WAVEfmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 2, true);
+  dv.setUint32(24, r.sampleRate, true); dv.setUint32(28, r.sampleRate * 4, true);
+  dv.setUint16(32, 4, true); dv.setUint16(34, 16, true); str(36, 'data'); dv.setUint32(40, n * 4, true);
+  for (let i = 0; i < n; i++) { dv.setInt16(44 + i * 4, r.left[i], true); dv.setInt16(46 + i * 4, r.right[i], true); }
+  return bytes;
+}
+
+// CRC-32 of every named sound at the default seed, as produced by ZeroSounds3.py.
+// zbVerifyAll compares against these, proving the two engines are bit-identical.
+const ZS_ORACLE_SEED = 0x1337BEEF;
+const ZS_ORACLE = /*ORACLE*/{"navigate": "333ACE88", "select": "EA98DA3A", "back": "F9E8CEBF", "pause": "1D0C0B0B", "notify": "5B48A362", "error": "29DE37CA", "save": "5840A935", "ammo": "FF7BA38E", "shield": "7F8F6A08", "key": "696D8C0B", "health": "FF6E3595", "jump": "DC459A88", "land": "F3464B12", "dash": "020130A7", "footstep": "EF7500E7", "roll": "E442A12A", "melee": "DF5C7FA5", "gunshot": "AC7E8B98", "plasma": "51725969", "reload": "580284B1", "ricochet": "7BF28F1C", "shieldHit": "8A2038D9", "explosion": "05F40736", "crash": "3176DE32", "thud": "0C8962A7", "glassBreak": "EBFEBE68", "powerUp": "E4496310", "levelUp": "761A3265", "recharge": "42A67734", "charge": "E3A0A0FD", "checkpoint": "1EBE88FD", "hurt": "44E63231", "death": "9BA08B96", "alarm": "90EDBD53", "warning": "C1C1EC2D", "door": "70945167", "terminal": "764A225D", "splash": "951C2B2F", "teleport": "A473685B", "switch": "C44E8EC1"}/*END*/;
+
+// Verify one sound: render twice, compare, and check the Python oracle if the seed matches.
+function zbVerifyOne(name, worldSeed = ZS_DEFAULT_SEED) {
+  const a = zsChecksum(zsRender(zbDeriveParams(name, worldSeed)));
+  const b = zsChecksum(zsRender(zbDeriveParams(name, worldSeed)));
+  const expect = (worldSeed >>> 0) === ZS_ORACLE_SEED ? ZS_ORACLE[name] : undefined;
+  return { crc: zsHex8(a), deterministic: a === b,
+    oracle: expect === undefined ? null : expect === zsHex8(a),
+    ok: a === b && (expect === undefined || expect === zsHex8(a)) };
+}
+function zbVerifyAll(worldSeed = ZS_DEFAULT_SEED) {
+  const res = {};
+  for (const name of Object.keys(ZB_SOUNDS)) res[name] = zbVerifyOne(name, worldSeed);
+  return res;
+}
+// </ENGINE>
+
+// ============================================================================
+// PLAYBACK - the only part that touches Web Audio
+// ============================================================================
+class ZS3Engine {
+  constructor() { this.ctx = null; this.gain = null; this.current = null; this.volume = 0.7; }
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    this.gain = this.ctx.createGain();
+    this.gain.gain.value = this.volume;
+    this.gain.connect(this.ctx.destination);
+  }
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); }
+  setVolume(v) { this.volume = v; if (this.gain) this.gain.gain.value = v; }
+  // Plays a zsRender() result. Returns the AudioContext start time.
+  play(render) {
+    this.init(); this.resume();
+    const n = render.left.length;
+    const buf = this.ctx.createBuffer(2, n, render.sampleRate);
+    const l = buf.getChannelData(0), r = buf.getChannelData(1);
+    for (let i = 0; i < n; i++) { l[i] = render.left[i] / 32768; r[i] = render.right[i] / 32768; }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.gain);
+    src.start();
+    this.current = src;
+    return this.ctx.currentTime;
+  }
+  now() { return this.ctx ? this.ctx.currentTime : 0; }
+}
+
+// ============================================================================
+// REACT COMPONENT
+// ============================================================================
+const ZS_CAT_COLOR = {
+  ui: '#c8f04a', pickup: '#ffd75e', movement: '#6fe3c1', combat: '#ff8f6b',
+  impact: '#ffb347', power: '#f0a8e8', damage: '#b7a6ff', environment: '#7fd4f5',
+};
+const ZS_SOURCE_LABEL = { fm: 'FM tone', wave: 'Wavetable', noise: 'Noise loop', modal: 'Struck object', thump: 'Pitch-drop sine' };
+const ZS_FORMAT_LABEL = { pcm16: '16-bit PCM', adpcm: 'Xbox ADPCM' };
+
+const ZS_CSS = `
+.zs3{--base:#0e2419;--panel:#153325;--well:#08170f;--line:#2a5a40;--text:#e6f5df;--dim:#98bfa3;--hot:#c8f04a;--warm:#ffb347;
+  background:var(--base);color:var(--text);font-family:"Saira","Trebuchet MS",system-ui,sans-serif;
+  padding:30px clamp(16px,4vw,44px) 40px;box-sizing:border-box;min-height:100%;line-height:1.45}
+.zs3 *{box-sizing:border-box}
+.zs3 :where(button,input,select){font:inherit;color:inherit}
+.zs3 :focus-visible{outline:2px solid var(--hot);outline-offset:2px}
+.zs3-top{display:flex;flex-wrap:wrap;gap:22px 48px;align-items:flex-end;justify-content:space-between;margin-bottom:28px}
+.zs3-title{margin:0;font-family:"Michroma","Saira",sans-serif;font-weight:400;font-size:clamp(26px,4.6vw,46px);letter-spacing:.01em;line-height:1.05}
+.zs3-title sup{font-size:.5em;color:var(--hot);margin-left:.2em;vertical-align:top;position:relative;top:.1em}
+.zs3-sub{margin:12px 0 0;color:var(--dim);max-width:50ch;font-size:16px}
+.zs3-seed{display:grid;grid-template-columns:auto 1fr;gap:9px 14px;align-items:center;min-width:min(100%,380px)}
+.zs3-seed label{color:var(--dim);font-size:14px}
+.zs3-hex{font-family:"Azeret Mono",ui-monospace,Menlo,monospace;font-size:20px;letter-spacing:.05em;background:var(--well);
+  border:1px solid var(--line);border-radius:999px;padding:6px 16px;width:12.5ch;color:var(--hot)}
+.zs3-range{width:100%;accent-color:var(--hot)}
+.zs3-wide{grid-column:1/-1}
+.zs3-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.zs3-btn{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:7px 15px;cursor:pointer;
+  display:inline-flex;gap:7px;align-items:center;font-size:15px;font-weight:500}
+.zs3-btn:hover{border-color:var(--hot)}
+.zs3-btn:disabled{opacity:.45;cursor:default}
+.zs3-btn svg{width:15px;height:15px;flex:none}
+.zs3-select{background:var(--well);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:15px}
+.zs3-body{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(330px,1fr);gap:28px;align-items:start}
+@media (max-width:920px){.zs3-body{grid-template-columns:1fr}}
+.zs3-tabs{display:flex;flex-wrap:wrap;gap:4px 6px;margin-bottom:14px}
+.zs3-tab{background:none;border:0;border-bottom:2px solid transparent;padding:5px 9px;cursor:pointer;font-size:15px;font-weight:500;color:var(--dim)}
+.zs3-tab:hover{color:var(--text)}
+.zs3-tab[aria-pressed="true"]{color:var(--text);border-bottom-color:var(--c,var(--hot))}
+.zs3-pads{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:9px}
+.zs3-pad{text-align:left;background:var(--panel);border:1px solid var(--line);border-radius:16px 16px 16px 4px;
+  padding:10px 13px 10px;cursor:pointer;position:relative;transition:transform .06s}
+.zs3-pad::before{content:"";position:absolute;left:13px;top:12px;width:8px;height:8px;border-radius:50%;background:var(--c)}
+.zs3-pad:hover{border-color:var(--c)}
+.zs3-pad:active{transform:scale(.98)}
+.zs3-pad[data-on="true"]{background:color-mix(in srgb,var(--c) 20%,var(--panel));border-color:var(--c)}
+.zs3-pad b{display:block;font-size:17px;font-weight:600;padding-left:16px}
+.zs3-pad span{display:block;font-size:13px;color:var(--dim);margin-top:2px}
+.zs3-side{background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:18px;position:sticky;top:16px}
+@media (max-width:920px){.zs3-side{position:static}}
+.zs3-side h2{margin:0;font-size:24px;font-weight:600}
+.zs3-meta{color:var(--dim);font-size:14px;margin:2px 0 12px}
+.zs3-view{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:12px;align-items:stretch}
+@media (max-width:480px){.zs3-view{grid-template-columns:1fr}}
+.zs3-scope{display:block;width:100%;height:150px;background:var(--well);border:1px solid var(--line);border-radius:14px}
+.zs3-field{background:var(--well);border:1px solid var(--line);border-radius:14px;display:block;width:100%;height:150px}
+.zs3-note{font-size:13px;color:var(--dim);margin:8px 0 0}
+.zs3-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:6px 16px;margin:14px 0;font-size:14px}
+.zs3-facts dt{color:var(--dim)}
+.zs3-facts dd{margin:0;font-weight:500}
+.zs3-facts dd.zs3-mono{font-family:"Azeret Mono",ui-monospace,Menlo,monospace;font-size:13px;font-weight:400}
+.zs3-voice{border-top:1px solid var(--line);padding:10px 0 8px;display:grid;grid-template-columns:1fr 104px;gap:3px 12px}
+.zs3-voice h3{margin:0;font-size:16px;font-weight:600}
+.zs3-voice h3 small{font-weight:400;color:var(--dim);font-size:14px;margin-left:6px}
+.zs3-voice p{margin:0;font-size:14px;color:var(--dim)}
+.zs3-env{grid-row:1/span 3;grid-column:2;width:104px;height:56px;background:var(--well);border-radius:8px;align-self:center}
+.zs3-key{display:flex;gap:14px;font-size:13px;color:var(--dim);margin-top:4px}
+.zs3-key i{display:inline-block;width:14px;height:0;border-top:2px solid var(--c);margin-right:5px;vertical-align:middle}
+.zs3-empty{color:var(--dim);font-size:15px;padding:22px 2px 6px;max-width:44ch}
+.zs3-foot{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:28px;margin-top:32px;padding-top:24px;border-top:1px solid var(--line)}
+.zs3-foot h2{margin:0 0 4px;font-size:19px;font-weight:600}
+.zs3-foot p{margin:0 0 12px;color:var(--dim);font-size:15px;max-width:58ch}
+.zs3-verify{margin-top:12px;font-size:15px}
+.zs3-verify strong[data-ok="true"]{color:var(--hot)}
+.zs3-verify strong[data-ok="false"]{color:#ff8f6b}
+.zs3-crcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:2px 14px;margin-top:8px;
+  font-family:"Azeret Mono",ui-monospace,Menlo,monospace;font-size:11px;color:var(--dim);max-height:150px;overflow:auto}
+.zs3-crcs i{font-style:normal;color:#ff8f6b}
+@media (prefers-reduced-motion:reduce){.zs3-pad{transition:none}}
+`;
+
+const ZsIcon = ({ d }) => (
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d={d} />
+  </svg>
+);
+const ZS_ICONS = {
+  play: 'M4.5 2.5v11l9-5.5z',
+  save: 'M8 2v8m0 0L4.8 6.8M8 10l3.2-3.2M2.5 13.5h11',
+  shuffle: 'M2 4.5h2.5l6 7H14m0 0-2-2m2 2-2 2M2 11.5h2.5l1.6-1.9M14 4.5h-3.5L9 6.3M14 4.5l-2-2m2 2-2 2',
+  check: 'M2.5 8.5l3.5 3.5 7.5-8',
+  next: 'M5.5 2.5l6 5.5-6 5.5',
+  prev: 'M10.5 2.5l-6 5.5 6 5.5',
+};
+
+function zsDescribeSource(layer) {
+  const s = layer.source;
+  if (s.kind === 'fm') return `ratio ${s.ratio}, index ${s.index0.toFixed(1)} to ${s.indexLoop.toFixed(1)}`;
+  if (s.kind === 'wave') return s.shape === 'sine' ? 'sine' : `${s.shape}, ${s.harmonics} harmonics`;
+  if (s.kind === 'noise') return `colour ${s.color.toFixed(2)}`;
+  if (s.kind === 'modal') return `${s.material}, ${s.partials} partials, rings ${s.t60.toFixed(2)} s`;
+  return `${Math.round(s.f1)} Hz falling to ${Math.round(s.f2)} Hz`;
+}
+
+function zsCanvasSize(canvas, fallbackW, fallbackH) {
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  const w = Math.max(1, Math.floor((canvas.clientWidth || fallbackW) * dpr));
+  const h = Math.max(1, Math.floor((canvas.clientHeight || fallbackH) * dpr));
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  return { w, h, dpr };
+}
+
+function zsDrawScope(canvas, render, color, playFrac) {
+  if (!canvas || !canvas.getContext) return;
+  const g = canvas.getContext('2d');
+  if (!g) return;
+  const { w, h, dpr } = zsCanvasSize(canvas, 400, 150);
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = '#2a5a40'; g.lineWidth = 1;
+  for (const y of [h * 0.25, h * 0.75]) { g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+  if (!render) return;
+  const n = render.left.length;
+  let pk = 1;
+  for (let i = 0; i < n; i++) { const a = Math.abs(render.left[i]), b = Math.abs(render.right[i]); if (a > pk) pk = a; if (b > pk) pk = b; }
+  g.fillStyle = color;
+  [render.left, render.right].forEach((ch, c) => {
+    const mid = h * (c === 0 ? 0.25 : 0.75), amp = h * 0.23;
+    for (let x = 0; x < w; x++) {
+      const a = Math.floor(x * n / w), b = Math.max(a + 1, Math.floor((x + 1) * n / w));
+      let lo = 32767, hi = -32768;
+      for (let i = a; i < b && i < n; i++) { const v = ch[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      const y0 = mid - hi / pk * amp, y1 = mid - lo / pk * amp;
+      g.fillRect(x, y0, 1, Math.max(1, y1 - y0));
+    }
+  });
+  if (playFrac >= 0 && playFrac <= 1) {
+    g.fillStyle = '#e6f5df';
+    g.fillRect(Math.floor(playFrac * (w - 1)), 0, Math.max(1, dpr), h);
+  }
+}
+
+// Top-down view: listener at the bottom centre, each voice on an arc at its azimuth.
+function zsDrawField(canvas, patch, color, time) {
+  if (!canvas || !canvas.getContext) return;
+  const g = canvas.getContext('2d');
+  if (!g) return;
+  const { w, h, dpr } = zsCanvasSize(canvas, 150, 150);
+  g.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h * 0.86, R = Math.min(w * 0.46, h * 0.74);
+  g.strokeStyle = '#2a5a40'; g.lineWidth = dpr;
+  for (const k of [0.5, 1]) { g.beginPath(); g.arc(cx, cy, R * k, Math.PI, 2 * Math.PI); g.stroke(); }
+  g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx, cy - R); g.stroke();
+  g.fillStyle = '#98bfa3';
+  g.beginPath(); g.arc(cx, cy, 5 * dpr, 0, 2 * Math.PI); g.fill();
+  g.beginPath(); g.moveTo(cx - 3 * dpr, cy - 4 * dpr); g.lineTo(cx, cy - 9 * dpr); g.lineTo(cx + 3 * dpr, cy - 4 * dpr); g.fill();
+  if (!patch) return;
+  const pt = (az, rr) => { const a = az * Math.PI / 180; return [cx + Math.sin(a) * R * rr, cy - Math.cos(a) * R * rr]; };
+  patch.layers.forEach((layer, i) => {
+    const rr = 1 - i * 0.14;
+    const moving = layer.az0 !== layer.az1;
+    if (moving) {
+      g.strokeStyle = color; g.globalAlpha = 0.45; g.lineWidth = 2 * dpr;
+      g.beginPath();
+      const a0 = (layer.az0 - 90) * Math.PI / 180, a1 = (layer.az1 - 90) * Math.PI / 180;
+      g.arc(cx, cy, R * rr, a0, a1, a1 < a0);
+      g.stroke(); g.globalAlpha = 1;
+    }
+    let u = time >= 0 ? Math.min(1, time / layer.moveTime) : 0;
+    const [x, y] = pt(layer.az0 + (layer.az1 - layer.az0) * u, rr);
+    g.fillStyle = color;
+    g.beginPath(); g.arc(x, y, (2.5 + 9 * layer.vol) * dpr, 0, 2 * Math.PI); g.fill();
+    g.fillStyle = '#08170f'; g.font = `${10 * dpr}px Saira, sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    if (layer.vol >= 0.2) g.fillText(String(i + 1), x, y + dpr * 0.5);
+  });
+}
+
+// Amplitude envelope (filled) and filter cutoff (line, 30 Hz to 8 kHz on a log scale).
+function zsDrawEnv(canvas, env, cuts, color) {
+  if (!canvas || !canvas.getContext) return;
+  const g = canvas.getContext('2d');
+  if (!g) return;
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+  const w = Math.floor(104 * dpr), h = Math.floor(56 * dpr);
+  canvas.width = w; canvas.height = h;
+  g.clearRect(0, 0, w, h);
+  if (!env || !env.length) return;
+  let pk = 1e-9;
+  for (let i = 0; i < env.length; i++) if (env[i] > pk) pk = env[i];
+  g.beginPath(); g.moveTo(0, h);
+  for (let x = 0; x < w; x++) g.lineTo(x, h - 2 - env[Math.floor(x * env.length / w)] / pk * (h - 6));
+  g.lineTo(w, h); g.closePath();
+  g.globalAlpha = 0.3; g.fillStyle = color; g.fill();
+  g.globalAlpha = 1; g.strokeStyle = color; g.lineWidth = dpr; g.stroke();
+  if (cuts && cuts.length) {
+    g.beginPath();
+    for (let x = 0; x < w; x++) {
+      const fc = cuts[Math.min(cuts.length - 1, Math.floor(x * env.length / w))];
+      const y = h - 3 - Math.log(fc / 30) / Math.log(8000 / 30) * (h - 6);
+      if (x === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.strokeStyle = '#e6f5df'; g.lineWidth = 1.5 * dpr; g.stroke();
+  }
+}
+
+function ZsVoice({ layer, env, cuts, color, index }) {
+  const ref = useRef(null);
+  useEffect(() => { zsDrawEnv(ref.current, env, cuts, color); }, [env, cuts, color]);
+  const pitch = layer.freq !== null ? `${Math.round(layer.freq)} Hz` : `rate ${layer.step0.toFixed(2)}`;
+  const glide = layer.pegReg !== 0 ? `, glides ${layer.pegReg > 0 ? 'up' : 'down'} ${(Math.abs(layer.pegReg) / 128).toFixed(1)} oct` : '';
+  const f = layer.filter;
+  let filter = 'No filter';
+  if (f.on && cuts && cuts.length) {
+    const a = Math.round(cuts[0]), b = Math.round(cuts[cuts.length - 1]);
+    filter = `Low-pass ${a === b ? `at ${a} Hz` : `${a} to ${b} Hz`}, resonance ${f.resDb.toFixed(0)} dB`;
+  }
+  const place = layer.az0 === layer.az1
+    ? (Math.abs(layer.az0) < 1 ? 'centre' : `${Math.abs(Math.round(layer.az0))}° ${layer.az0 > 0 ? 'right' : 'left'}`)
+    : `moves ${Math.round(layer.az0)}° to ${Math.round(layer.az1)}°`;
+  return (
+    <div className="zs3-voice">
+      <h3>Voice {index + 1}<small>{layer.role}, {place}</small></h3>
+      <p>{ZS_SOURCE_LABEL[layer.source.kind]}: {zsDescribeSource(layer)}. Stored as {ZS_FORMAT_LABEL[layer.format]}.</p>
+      <p>{pitch}{glide}{layer.notes.length > 1 ? `, ${layer.notes.length} key-ons` : ''}. {filter}.</p>
+      <canvas className="zs3-env" ref={ref} aria-label={`Voice ${index + 1} amplitude envelope and filter cutoff`} />
+    </div>
+  );
+}
+
+function ZeroSounds3({ initialSeed = ZS_DEFAULT_SEED, initialVolume = 0.7, initialRoom = 'auto', onPlay = null, className = '' }) {
+  const engineRef = useRef(null);
+  const cacheRef = useRef(new Map());
+  const scopeRef = useRef(null);
+  const fieldRef = useRef(null);
+  const rafRef = useRef(0);
+  const [seed, setSeed] = useState(initialSeed >>> 0);
+  const [hexText, setHexText] = useState(zsHex8(initialSeed));
+  const [volume, setVolume] = useState(initialVolume);
+  const [room, setRoom] = useState(initialRoom);
+  const [category, setCategory] = useState('all');
+  const [active, setActive] = useState(null);          // { name, label, patch, render, crc }
+  const [patchNo, setPatchNo] = useState(0);
+  const [verify, setVerify] = useState(null);          // { done, total, results, running }
+
+  const patches = useMemo(() => {
+    const o = {};
+    for (const name of Object.keys(ZB_SOUNDS)) o[name] = zbDeriveParams(name, seed);
+    return o;
+  }, [seed]);
+
+  const engine = () => {
+    if (!engineRef.current) { engineRef.current = new ZS3Engine(); engineRef.current.setVolume(volume); }
+    return engineRef.current;
+  };
+
+  const applySeed = useCallback((v) => {
+    const s = v >>> 0;
+    setSeed(s); setHexText(zsHex8(s)); setVerify(null);
+  }, []);
+
+  const renderCached = useCallback((key, patch) => {
+    const cache = cacheRef.current;
+    if (cache.has(key)) return cache.get(key);
+    const render = zsRender(patch);
+    const entry = { render, crc: zsHex8(zsChecksum(render)) };
+    if (cache.size >= 64) cache.delete(cache.keys().next().value);
+    cache.set(key, entry);
+    return entry;
+  }, []);
+
+  const color = active ? ZS_CAT_COLOR[active.patch.category] : '#c8f04a';
+
+  // Patches are plain data: the environment override just swaps reverb.room before rendering.
+  const play = useCallback((name, label, basePatch, roomChoice) => {
+    const patch = roomChoice === 'auto' ? basePatch : { ...basePatch, reverb: { ...basePatch.reverb, room: roomChoice } };
+    const { render, crc } = renderCached(`${patch.worldSeed}:${name}:${patch.reverb.room}`, patch);
+    setActive({ name, label, patch, basePatch, render, crc });
+    let t0 = 0, eng = null;
+    try { eng = engine(); t0 = eng.play(render); } catch (e) { eng = null; }
+    cancelAnimationFrame(rafRef.current);
+    const dur = render.left.length / render.sampleRate;
+    const c = ZS_CAT_COLOR[patch.category];
+    const tick = () => {
+      const f = eng ? (eng.now() - t0) / dur : 2;
+      zsDrawScope(scopeRef.current, render, c, f);
+      zsDrawField(fieldRef.current, patch, c, f <= 1 ? f * dur : -1);
+      if (f < 1) rafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+    if (onPlay) onPlay(name, patch, render);
+  }, [renderCached, onPlay, volume]);
+
+  useEffect(() => () => cancelAnimationFrame(rafRef.current), []);
+  useEffect(() => {
+    if (!active) { zsDrawScope(scopeRef.current, null, color, -1); zsDrawField(fieldRef.current, null, color, -1); }
+  }, [active, color]);
+
+  const playPatchNo = (n) => {
+    const k = Math.max(0, n);
+    setPatchNo(k);
+    play(`patch#${k}`, `Patch ${k}`, zbRandomize(k, seed), room);
+  };
+
+  const changeRoom = (r) => {
+    setRoom(r);
+    if (active) play(active.name, active.label, active.basePatch, r);
+  };
+
+  const download = () => {
+    if (!active) return;
+    const blob = new Blob([zsEncodeWav(active.render)], { type: 'audio/wav' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${active.name.replace('#', '')}_${zsHex8(active.patch.worldSeed)}.wav`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+
+  const runVerify = () => {
+    const names = Object.keys(ZB_SOUNDS);
+    const results = {};
+    let i = 0;
+    const stepFn = () => {
+      results[names[i]] = zbVerifyOne(names[i], seed);
+      i++;
+      setVerify({ done: i, total: names.length, results: { ...results }, running: i < names.length, seed });
+      if (i < names.length) setTimeout(stepFn, 0);
+    };
+    setVerify({ done: 0, total: names.length, results: {}, running: true, seed });
+    setTimeout(stepFn, 0);
+  };
+
+  const names = Object.keys(ZB_SOUNDS).filter((n) => category === 'all' || ZB_SOUNDS[n].category === category);
+  const verifyOk = verify && !verify.running && Object.values(verify.results).every((r) => r.ok);
+  const oracleChecked = verify && Object.values(verify.results).some((r) => r.oracle !== null);
+
+  return (
+    <div className={`zs3 ${className}`}>
+      <style>{ZS_CSS}</style>
+
+      <header className="zs3-top">
+        <div>
+          <h1 className="zs3-title">Zero Sounds<sup>3</sup></h1>
+          <p className="zs3-sub">Sound effects in the style of the 2001 Xbox, synthesised from one seed. Change the seed and all 40 sounds change with it.</p>
+        </div>
+        <div className="zs3-seed">
+          <label htmlFor="zs3-hex">World seed</label>
+          <div className="zs3-row">
+            <input id="zs3-hex" className="zs3-hex" value={hexText} spellCheck={false} maxLength={10}
+              onChange={(e) => {
+                setHexText(e.target.value);
+                const t = e.target.value.replace(/^0x/i, '');
+                if (/^[0-9a-fA-F]{1,8}$/.test(t)) { setSeed(parseInt(t, 16) >>> 0); setVerify(null); }
+              }}
+              onBlur={() => setHexText(zsHex8(seed))} />
+            <button className="zs3-btn" onClick={() => applySeed(zbHash(seed, 0x5EED))}><ZsIcon d={ZS_ICONS.shuffle} />Next seed</button>
+          </div>
+          <input className="zs3-range zs3-wide" type="range" min={0} max={0xFFFFFFFF} step={1} value={seed} aria-label="World seed slider"
+            onChange={(e) => applySeed(Number(e.target.value))} />
+          <label htmlFor="zs3-room">Environment</label>
+          <select id="zs3-room" className="zs3-select" value={room} onChange={(e) => changeRoom(e.target.value)}>
+            <option value="auto">Chosen by the seed</option>
+            {ZS_ROOM_ORDER.map((r) => <option key={r} value={r}>{r[0].toUpperCase() + r.slice(1)}</option>)}
+          </select>
+          <label htmlFor="zs3-vol">Volume</label>
+          <input id="zs3-vol" className="zs3-range" type="range" min={0} max={1} step={0.01} value={volume}
+            onChange={(e) => { const v = Number(e.target.value); setVolume(v); if (engineRef.current) engineRef.current.setVolume(v); }} />
+        </div>
+      </header>
+
+      <div className="zs3-body">
+        <section aria-label="Sounds">
+          <div className="zs3-tabs">
+            {['all', ...ZB_CATEGORY_ORDER].map((c) => (
+              <button key={c} className="zs3-tab" aria-pressed={category === c} style={{ '--c': ZS_CAT_COLOR[c] }}
+                onClick={() => setCategory(c)}>{c === 'ui' ? 'UI' : c[0].toUpperCase() + c.slice(1)}</button>
+            ))}
+          </div>
+          <div className="zs3-pads">
+            {names.map((name) => {
+              const p = patches[name];
+              return (
+                <button key={name} className="zs3-pad" style={{ '--c': ZS_CAT_COLOR[p.category] }}
+                  data-on={active && active.name === name ? 'true' : 'false'}
+                  onClick={() => play(name, ZB_SOUNDS[name].label, p, room)}>
+                  <b>{ZB_SOUNDS[name].label}</b>
+                  <span>{p.archetype}, {p.layers.length} voices, {room === 'auto' ? p.reverb.room : room}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <aside className="zs3-side" aria-label="Inspector">
+          <h2>{active ? active.label : 'Nothing played yet'}</h2>
+          <p className="zs3-meta">{active
+            ? `${active.patch.category}, ${active.patch.archetype} archetype, sound seed 0x${zsHex8(active.patch.soundSeed)}`
+            : 'Press a sound to render it and see how it was built.'}</p>
+          <div className="zs3-view">
+            <canvas className="zs3-scope" ref={scopeRef} aria-label="Stereo waveform of the last sound" />
+            <canvas className="zs3-field" ref={fieldRef} aria-label="Top-down view of where each voice sits around the listener" />
+          </div>
+          <p className="zs3-note">Left: the two output channels. Right: each voice seen from above, with you at the bottom. Headphones make the placement clearer.</p>
+          {active ? (
+            <React.Fragment>
+              <dl className="zs3-facts">
+                <div><dt>Length</dt><dd>{(active.render.left.length / ZS_SR).toFixed(2)} s</dd></div>
+                <div><dt>Sample memory</dt><dd>{(active.render.sampleBytes / 1024).toFixed(1)} KB</dd></div>
+                <div><dt>Reverb</dt><dd>{active.patch.reverb.room}, {Math.round(active.patch.reverb.wet * 100)}%</dd></div>
+                <div><dt>CRC-32</dt><dd className="zs3-mono">{active.crc}</dd></div>
+              </dl>
+              <div className="zs3-row" style={{ marginBottom: 12 }}>
+                <button className="zs3-btn" onClick={() => play(active.name, active.label, active.basePatch, room)}><ZsIcon d={ZS_ICONS.play} />Play again</button>
+                <button className="zs3-btn" onClick={download}><ZsIcon d={ZS_ICONS.save} />Download WAV</button>
+              </div>
+              {active.patch.layers.map((layer, i) => (
+                <ZsVoice key={`${active.crc}-${i}`} layer={layer} env={active.render.layerEnvs[i]} cuts={active.render.layerCuts[i]} color={color} index={i} />
+              ))}
+              <div className="zs3-key">
+                <span><i style={{ '--c': color }} />loudness over time</span>
+                <span><i style={{ '--c': '#e6f5df' }} />filter cutoff, 30 Hz to 8 kHz</span>
+              </div>
+            </React.Fragment>
+          ) : (
+            <p className="zs3-empty">Each sound is three or four voices. Their source samples, filters, envelopes and positions show up here.</p>
+          )}
+        </aside>
+      </div>
+
+      <footer className="zs3-foot">
+        <section>
+          <h2>Unnamed patches</h2>
+          <p>Beyond the 40 named sounds, every whole number is a sound. The same number and seed give the same sound on any machine.</p>
+          <div className="zs3-row">
+            <button className="zs3-btn" onClick={() => playPatchNo(patchNo - 1)} disabled={patchNo <= 0} aria-label="Previous patch"><ZsIcon d={ZS_ICONS.prev} /></button>
+            <button className="zs3-btn" onClick={() => playPatchNo(patchNo)}><ZsIcon d={ZS_ICONS.play} />Play patch {patchNo}</button>
+            <button className="zs3-btn" onClick={() => playPatchNo(patchNo + 1)} aria-label="Next patch"><ZsIcon d={ZS_ICONS.next} /></button>
+          </div>
+        </section>
+        <section>
+          <h2>Check determinism</h2>
+          <p>Renders every sound twice and compares checksums. At seed 0x1337BEEF it also compares against the checksums from the Python engine.</p>
+          <button className="zs3-btn" onClick={runVerify} disabled={!!(verify && verify.running)}><ZsIcon d={ZS_ICONS.check} />Check all 40 sounds</button>
+          {verify && (
+            <div className="zs3-verify" role="status">
+              {verify.running
+                ? `Checking ${verify.done} of ${verify.total}`
+                : <strong data-ok={verifyOk ? 'true' : 'false'}>{verifyOk
+                  ? `All ${verify.total} sounds are deterministic${oracleChecked ? ' and match the Python engine' : ''}.`
+                  : 'Some sounds did not match. They are marked below.'}</strong>}
+              <div className="zs3-crcs">
+                {Object.entries(verify.results).map(([n, r]) => (
+                  <span key={n}>{n} {r.crc}{r.ok ? '' : <i> mismatch</i>}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      </footer>
+    </div>
+  );
+}
+
+export {
+  zbHash, zbFloat, zbRange, zbInt, zbDeriveParams, zbRandomize,
+  zsRender, zsChecksum, zsEncodeWav, zbVerifyOne, zbVerifyAll,
+  ZS3Engine, ZB_SOUNDS, ZB_CATEGORIES, ZS_ROOMS,
+};
+export default ZeroSounds3;
